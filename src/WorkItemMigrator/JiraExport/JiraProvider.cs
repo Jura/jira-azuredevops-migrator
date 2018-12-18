@@ -15,18 +15,29 @@ namespace JiraExport
         [Flags]
         public enum DownloadOptions
         {
-            IncludeParentEpics,
-            IncludeEpicChildren,
-            IncludeParents,
-            IncludeSubItems,
-            IncludeLinkedItems
+            None = 0,
+            IncludeParentEpics = 1,
+            IncludeEpicChildren = 2,
+            IncludeParents = 3,
+            IncludeSubItems = 4,
+            IncludeLinkedItems = 5
         }
 
-    public static JiraProvider Initialize(JiraSettings settings)
+        readonly Dictionary<string, string> _userEmailCache = new Dictionary<string, string>();
+
+        public Jira Jira { get; private set; }
+
+        public JiraSettings Settings { get; private set; }
+
+        public IEnumerable<IssueLinkType> LinkTypes { get; private set; }
+
+        private JiraProvider()
         {
+        }
 
+        public static JiraProvider Initialize(JiraSettings settings)
+        {
             var provider = new JiraProvider();
-
             provider.Jira = ConnectToJira(settings);
             provider.Settings = settings;
 
@@ -61,141 +72,12 @@ namespace JiraExport
             return jira;
         }
 
-        private JiraProvider()
-        {
-        }
-
-        public Jira Jira { get; private set;}
-        public JiraSettings Settings { get; private set; }
-        public IEnumerable<IssueLinkType> LinkTypes { get; private set; }
-
-
         private JiraItem ProcessItem(string issueKey, HashSet<string> skipList, string successMessage)
         {
             var issue = JiraItem.CreateFromRest(issueKey, this);
             Logger.Log(LogLevel.Info, $"Downloaded {issueKey} - {successMessage}");
             skipList.Add(issue.Key);
             return issue;
-        }
-
-        public IEnumerable<JiraItem> EnumerateIssues(string jql, HashSet<string> skipList, DownloadOptions downloadOptions)
-        {
-            Logger.Log(LogLevel.Info, "Processing issues...");
-            int currentStart = 0;
-            IEnumerable<string> remoteIssueBatch = null;
-            int index = 0;
-            do
-            {
-                var response = Jira.RestClient.ExecuteRequestAsync(RestSharp.Method.GET,
-                    $"rest/api/2/search?jql={jql}&startAt={currentStart}&maxResults={Settings.BatchSize}&fields=key").Result;
-
-                remoteIssueBatch = response.SelectTokens("$.issues[*]").OfType<JObject>()
-                                           .Select(i => i.SelectToken("$.key").Value<string>());
-
-                currentStart += Settings.BatchSize;
-
-                int totalItems = (int)response.SelectToken("$.total");
-
-                foreach (var issueKey in remoteIssueBatch)
-                {
-                    if (skipList.Contains(issueKey))
-                    {
-                        Logger.Log(LogLevel.Info, $"Skipped {issueKey} - already downloaded [{index + 1}/{totalItems}]");
-                        index++;
-                        continue;
-                    }
-
-
-                    var issue = ProcessItem(issueKey, skipList, $"[{index + 1}/{totalItems}]");
-                    yield return issue;
-                    index++;
-
-                    if (downloadOptions.HasFlag(DownloadOptions.IncludeParentEpics) && issue.EpicParent != null && !skipList.Contains(issue.EpicParent))
-                    {
-                        var parentEpic = ProcessItem(issue.EpicParent, skipList, $"epic parent of {issueKey}");
-                        yield return parentEpic;
-                    }
-
-                    if (downloadOptions.HasFlag(DownloadOptions.IncludeParents) && issue.Parent != null && !skipList.Contains(issue.EpicParent))
-                    {
-                        var parent = ProcessItem(issue.Parent, skipList, $"parent of {issueKey}");
-                        yield return parent;
-                    }
-
-                    if (downloadOptions.HasFlag(DownloadOptions.IncludeSubItems) && issue.SubItems != null && issue.SubItems.Any())
-                    {
-                        foreach (var subitemKey in issue.SubItems)
-                        {
-                            if (!skipList.Contains(subitemKey))
-                            {
-                                var subItem = ProcessItem(subitemKey, skipList, $"sub-item of {issueKey}");
-                                yield return subItem;
-                            }
-                        }
-                    }
-                }
-            }
-            while (remoteIssueBatch != null && remoteIssueBatch.Any());
-        }
-
-        public IEnumerable<JObject> DownloadChangelog(string issueKey)
-        {
-            bool isLast = true;
-            int batchSize = 100;
-            int currentStart = 0;
-            do
-            {
-                var response = (JObject)Jira.RestClient.ExecuteRequestAsync(RestSharp.Method.GET,
-                    $"rest/api/2/issue/{issueKey}/changelog?maxResults={batchSize}&startAt={currentStart}").Result;
-
-                currentStart += batchSize;
-                isLast = (bool)response.SelectToken("$.isLast");
-
-                var changes = response.SelectTokens("$.values[*]").Cast<JObject>();
-                foreach (var change in changes)
-                    yield return change;
-
-            } while (!isLast);
-        }
-
-        public JObject DownloadIssue(string key)
-        {
-            var response = Jira.RestClient.ExecuteRequestAsync(RestSharp.Method.GET, $"rest/api/2/issue/{key}?expand=renderedFields").Result;
-            var remoteItem = (JObject)response;
-            return remoteItem;
-        }
-
-        public async Task<List<RevisionAction<JiraAttachment>>> DownloadAttachments(JiraRevision rev)
-        {
-            var attChanges = rev.AttachmentActions;
-
-            if (attChanges != null && attChanges.Any(a => a.ChangeType == RevisionChangeType.Added))
-            {
-                var downloadedAtts = new List<JiraAttachment>();
-                using (var web = new WebClientWrapper(this))
-                {
-                    foreach (var remoteAtt in attChanges)
-                    {
-                        var jiraAtt = await DownloadAttachmentAsync(remoteAtt.Value, web);
-                        if (jiraAtt != null && !string.IsNullOrWhiteSpace(jiraAtt.LocalPath))
-                        {
-                            Logger.Log(LogLevel.Info, $"Downloaded {jiraAtt.ToString()} to {jiraAtt.LocalPath}");
-                            downloadedAtts.Add(jiraAtt);
-                        }
-                    }
-                }
-
-                // of added attachments, leave only attachments that have been successfully downloaded
-                attChanges.RemoveAll(ac => ac.ChangeType == RevisionChangeType.Added);
-                attChanges.AddRange(downloadedAtts.Select(da => new RevisionAction<JiraAttachment>() { ChangeType = RevisionChangeType.Added, Value = da }));
-            }
-
-            return attChanges;
-        }
-
-        public int GetNumberOfComments(string key)
-        {
-            return Jira.Issues.GetCommentsAsync(key).Result.Count();
         }
 
         private async Task<JiraAttachment> GetAttachmentInfo(string id)
@@ -275,7 +157,112 @@ namespace JiraExport
             }
         }
 
-        readonly Dictionary<string, string> _userEmailCache = new Dictionary<string, string>();
+        public IEnumerable<JiraItem> EnumerateIssues(string jql, HashSet<string> skipList, DownloadOptions downloadOptions)
+        {
+            Logger.Log(LogLevel.Info, "Processing issues...");
+            int currentStart = 0;
+            IEnumerable<string> remoteIssueBatch = null;
+            int index = 0;
+            do
+            {
+                var response = Jira.RestClient.ExecuteRequestAsync(RestSharp.Method.GET,
+                    $"rest/api/2/search?jql={jql}&startAt={currentStart}&maxResults={Settings.BatchSize}&fields=key").Result;
+
+                remoteIssueBatch = response.SelectTokens("$.issues[*]").OfType<JObject>()
+                                           .Select(i => i.SelectToken("$.key").Value<string>());
+
+                currentStart += Settings.BatchSize;
+
+                int totalItems = (int)response.SelectToken("$.total");
+
+                foreach (var issueKey in remoteIssueBatch)
+                {
+                    if (skipList.Contains(issueKey))
+                    {
+                        Logger.Log(LogLevel.Info, $"Skipped {issueKey} - already downloaded [{index + 1}/{totalItems}]");
+                        index++;
+                        continue;
+                    }
+
+
+                    var issue = ProcessItem(issueKey, skipList, $"[{index + 1}/{totalItems}]");
+                    yield return issue;
+                    index++;
+
+                    if (downloadOptions.HasFlag(DownloadOptions.IncludeParentEpics) && issue.EpicParent != null && !skipList.Contains(issue.EpicParent))
+                    {
+                        var parentEpic = ProcessItem(issue.EpicParent, skipList, $"epic parent of {issueKey}");
+                        yield return parentEpic;
+                    }
+
+                    if (downloadOptions.HasFlag(DownloadOptions.IncludeParents) && issue.Parent != null && !skipList.Contains(issue.EpicParent))
+                    {
+                        var parent = ProcessItem(issue.Parent, skipList, $"parent of {issueKey}");
+                        yield return parent;
+                    }
+
+                    if (downloadOptions.HasFlag(DownloadOptions.IncludeSubItems) && issue.SubItems != null && issue.SubItems.Any())
+                    {
+                        foreach (var subitemKey in issue.SubItems)
+                        {
+                            if (!skipList.Contains(subitemKey))
+                            {
+                                var subItem = ProcessItem(subitemKey, skipList, $"sub-item of {issueKey}");
+                                yield return subItem;
+                            }
+                        }
+                    }
+                }
+            }
+            while (remoteIssueBatch != null && remoteIssueBatch.Any());
+        }
+
+        public IEnumerable<JObject> DownloadChangelog(string issueKey)
+        {
+            var response = (JObject)Jira.RestClient.ExecuteRequestAsync(RestSharp.Method.GET, $"rest/api/2/issue/{issueKey}?expand=changelog&fields=created").Result;
+            return response.SelectTokens("$.histories[*]").Cast<JObject>();
+        }
+
+        public JObject DownloadIssue(string key)
+        {
+            var response = Jira.RestClient.ExecuteRequestAsync(RestSharp.Method.GET, $"rest/api/2/issue/{key}?expand=renderedFields").Result;
+            var remoteItem = (JObject)response;
+            return remoteItem;
+        }
+
+        public async Task<List<RevisionAction<JiraAttachment>>> DownloadAttachments(JiraRevision rev)
+        {
+            var attChanges = rev.AttachmentActions;
+
+            if (attChanges != null && attChanges.Any(a => a.ChangeType == RevisionChangeType.Added))
+            {
+                var downloadedAtts = new List<JiraAttachment>();
+                using (var web = new WebClientWrapper(this))
+                {
+                    foreach (var remoteAtt in attChanges)
+                    {
+                        var jiraAtt = await DownloadAttachmentAsync(remoteAtt.Value, web);
+                        if (jiraAtt != null && !string.IsNullOrWhiteSpace(jiraAtt.LocalPath))
+                        {
+                            Logger.Log(LogLevel.Info, $"Downloaded {jiraAtt.ToString()} to {jiraAtt.LocalPath}");
+                            downloadedAtts.Add(jiraAtt);
+                        }
+                    }
+                }
+
+                // of added attachments, leave only attachments that have been successfully downloaded
+                attChanges.RemoveAll(ac => ac.ChangeType == RevisionChangeType.Added);
+                attChanges.AddRange(downloadedAtts.Select(da => new RevisionAction<JiraAttachment>() { ChangeType = RevisionChangeType.Added, Value = da }));
+            }
+
+            return attChanges;
+        }
+
+        public int GetNumberOfComments(string key)
+        {
+            return Jira.Issues.GetCommentsAsync(key).Result.Count();
+        }
+
         public string GetUserEmail(string username)
         {
             if (_userEmailCache.TryGetValue(username, out string email))
@@ -287,6 +274,22 @@ namespace JiraExport
                 _userEmailCache.Add(username, email);
                 return email;
             }
+        }
+
+        public string GetCustomId(string propertyName)
+        {
+            var customId = string.Empty;
+            var response = (JArray)Jira.RestClient.ExecuteRequestAsync(RestSharp.Method.GET, $"rest/api/2/field").Result;
+            foreach (var item in response)
+            {
+                var nameField = (JValue)item.SelectToken("name");
+                if (nameField.Value.ToString().ToLower() == propertyName.ToLower())
+                {
+                    var idField = (JValue)item.SelectToken("id");
+                    customId = idField.Value.ToString();
+                }
+            }
+            return customId;
         }
     }
 }

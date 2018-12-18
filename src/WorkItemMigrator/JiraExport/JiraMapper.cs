@@ -194,7 +194,7 @@ namespace JiraExport
                     Change = change,
                     AttOriginId = att.Value.Id,
                     FilePath = att.Value.LocalPath,
-                    Comment = "Imported from Jira" // customization point
+                    Comment = "Imported from Jira"
                 };
                 attachments.Add(wiAtt);
 
@@ -223,30 +223,27 @@ namespace JiraExport
             {
                 var type = (from t in _config.TypeMap.Types where t.Source == r.Type select t.Target).FirstOrDefault();
 
-                if(type != null)
+                if (type != null && _fieldMappingsPerType.TryGetValue(type, out var mapping))
                 {
-                    if (_fieldMappingsPerType.TryGetValue(type, out var mapping))
+                    foreach (var field in mapping)
                     {
-                        foreach (var field in mapping)
+                        try
                         {
-                            try
-                            {
-                                var fieldreference = field.Key;
-                                var (include, value) = field.Value(r);
+                            var fieldreference = field.Key;
+                            var (include, value) = field.Value(r);
 
-                                if (include)
-                                {
-                                    fields.Add(new WiField()
-                                    {
-                                        ReferenceName = fieldreference,
-                                        Value = value
-                                    });
-                                }
-                            }
-                            catch (Exception ex)
+                            if (include)
                             {
-                                Logger.Log(LogLevel.Error, $"Error mapping field {field.Key} on item {r.OriginId}: {ex.Message}");
+                                fields.Add(new WiField()
+                                {
+                                    ReferenceName = fieldreference,
+                                    Value = value
+                                });
                             }
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Log(LogLevel.Error, $"Error mapping field {field.Key} on item {r.OriginId}: {ex.Message}");
                         }
                     }
                 }
@@ -270,6 +267,7 @@ namespace JiraExport
             {
                 if (item.Source != null)
                 {
+                    var isCustomField = item.SourceType == "name";
                     Func<JiraRevision, (bool, object)> value;
 
                     if (item.Mapping?.Values != null)
@@ -284,16 +282,19 @@ namespace JiraExport
                                 value = r => MapTitle(r);
                                 break;
                             case "MapUser":
-                                value = IfChanged<string>(item.Source, MapUser);
+                                value = IfChanged<string>(item.Source, isCustomField, MapUser);
                                 break;
                             case "MapSprint":
-                                value = IfChanged<string>(_jiraProvider.Settings.SprintField, MapSprint);
+                                value = IfChanged<string>(item.Source, isCustomField, MapSprint);
                                 break;
                             case "MapTags":
-                                value = IfChanged<string>(item.Source, MapTags);
+                                value = IfChanged<string>(item.Source, isCustomField, MapTags);
+                                break;
+                            case "MapRemainingWork":
+                                value = IfChanged<string>(item.Source, isCustomField, MapRemainingWork);
                                 break;
                             default:
-                                value = IfChanged<string>(item.Source);
+                                value = IfChanged<string>(item.Source, isCustomField);
                                 break;
                         }
                     }
@@ -302,19 +303,19 @@ namespace JiraExport
                         var dataType = item.Type.ToLower();
                         if (dataType == "double")
                         {
-                            value = IfChanged<double>(item.Source);
+                            value = IfChanged<double>(item.Source, isCustomField);
                         }
                         else if (dataType == "int" || dataType == "integer")
                         {
-                            value = IfChanged<int>(item.Source);
+                            value = IfChanged<int>(item.Source, isCustomField);
                         }
                         else if (dataType == "datetime" || dataType == "date")
                         {
-                            value = IfChanged<DateTime>(item.Source);
+                            value = IfChanged<DateTime>(item.Source, isCustomField);
                         }
                         else
                         {
-                            value = IfChanged<string>(item.Source);
+                            value = IfChanged<string>(item.Source, isCustomField);
                         }
                     }
 
@@ -373,25 +374,37 @@ namespace JiraExport
             return mappingPerWiType;
         }
 
-        private static Func<JiraRevision, (bool, object)> IfChanged<T>(string sourceField, Func<T, object> mapperFunc)
+        private object MapRemainingWork(string seconds)
         {
-            return (r) =>
-            {
-                if (r.Fields.TryGetValue(sourceField, out object value))
-                    return (true, mapperFunc((T)value));
-                else
-                    return (false, null);
-            };
+            var secs = Convert.ToDouble(seconds);
+            return TimeSpan.FromSeconds(secs).TotalHours;
         }
 
-        private static Func<JiraRevision, (bool, object)> IfChanged<T>(string sourceField)
+        private Func<JiraRevision, (bool, object)> IfChanged<T>(string sourceField, bool isCustomField, Func<T, object> mapperFunc = null)
         {
+            if (isCustomField)
+            {
+                var customFieldName = _jiraProvider.GetCustomId(sourceField);
+                sourceField = customFieldName;
+            }
+
             return (r) =>
             {
-                if (r.Fields.TryGetValue(sourceField, out object value))
-                    return (true, (T)value);
+                if (r.Fields.TryGetValue(sourceField.ToLower(), out object value))
+                {
+                    if (mapperFunc != null)
+                    {
+                        return (true, mapperFunc((T)value));
+                    }
+                    else
+                    {
+                        return (true, (T)value);
+                    }
+                }
                 else
+                {
                     return (false, null);
+                }
             };
         }
 
@@ -411,14 +424,12 @@ namespace JiraExport
             {
                 foreach (var item in _config.FieldMap.Fields)
                 {
-                    if ((item.Source == itemSource && (item.For.Contains(targetWit) || item.For == "All")) ||
-                         item.Source == itemSource && (!string.IsNullOrWhiteSpace(item.NotFor) && !item.NotFor.Contains(targetWit)))
+                    if (((item.Source == itemSource && (item.For.Contains(targetWit) || item.For == "All")) ||
+                          item.Source == itemSource && (!string.IsNullOrWhiteSpace(item.NotFor) && !item.NotFor.Contains(targetWit))) &&
+                          item.Mapping?.Values != null)
                     {
-                        if (item.Mapping?.Values != null)
-                        {
-                            var mappedValue = (from s in item.Mapping.Values where s.Source == value.ToString() select s.Target).FirstOrDefault();
-                            return (true, mappedValue);
-                        }
+                        var mappedValue = (from s in item.Mapping.Values where s.Source == value.ToString() select s.Target).FirstOrDefault();
+                        return (true, mappedValue);
                     }
                 }
                 return (true, value);
@@ -458,28 +469,29 @@ namespace JiraExport
         {
             var descFieldName = issue.Type == "Bug" ? "Microsoft.VSTS.TCM.ReproSteps" : "System.Description";
 
-            var lastDescUpdateRev =
-                ((IEnumerable<WiRevision>)revisions)
-               .Reverse()
-               .FirstOrDefault(r => r.Fields.Any(i => i.ReferenceName.Equals(descFieldName, StringComparison.InvariantCultureIgnoreCase)));
-            var lastDescUpdate = lastDescUpdateRev
-                                ?.Fields
-                                ?.FirstOrDefault(i => i.ReferenceName.Equals(descFieldName, StringComparison.InvariantCultureIgnoreCase));
-            var renderedDescription = MapRenderedDescription(issue);
+            var lastDescUpdateRev = ((IEnumerable<WiRevision>)revisions)
+                                        .Reverse()
+                                        .FirstOrDefault(r => r.Fields.Any(i => i.ReferenceName.Equals(descFieldName, StringComparison.InvariantCultureIgnoreCase)));
 
-            if (lastDescUpdate == null && !string.IsNullOrWhiteSpace(renderedDescription))
+            if (lastDescUpdateRev != null)
             {
-                lastDescUpdate = new Migration.WIContract.WiField() { ReferenceName = descFieldName, Value = renderedDescription };
-                lastDescUpdateRev = revisions.First();
-                lastDescUpdateRev.Fields.Add(lastDescUpdate);
-            }
+                var lastDescUpdate = lastDescUpdateRev?.Fields?.FirstOrDefault(i => i.ReferenceName.Equals(descFieldName, StringComparison.InvariantCultureIgnoreCase));
+                var renderedDescription = MapRenderedDescription(issue);
 
-            if (lastDescUpdate != null)
-            {
-                lastDescUpdate.Value = renderedDescription;
-            }
+                if (lastDescUpdate == null && !string.IsNullOrWhiteSpace(renderedDescription))
+                {
+                    lastDescUpdate = new WiField() { ReferenceName = descFieldName, Value = renderedDescription };
+                    lastDescUpdateRev = revisions.First();
+                    lastDescUpdateRev.Fields.Add(lastDescUpdate);
+                }
 
-            lastDescUpdateRev.AttachmentReferences = true;
+                if (lastDescUpdate != null)
+                {
+                    lastDescUpdate.Value = renderedDescription;
+                }
+
+                lastDescUpdateRev.AttachmentReferences = true;
+            }
         }
 
         private string MapRenderedDescription(JiraItem issue)
